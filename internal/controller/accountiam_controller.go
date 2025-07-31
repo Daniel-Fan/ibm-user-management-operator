@@ -17,14 +17,11 @@ limitations under the License.
 package controller
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
-	"text/template"
 	"time"
 
 	certmgrv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -200,48 +197,23 @@ func (r *AccountIAMReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	// Create a copy of the status to detect changes
-	originalStatus := instance.Status.DeepCopy()
+	// Create reconciliation context
+	reconcilationCtx := NewReconciliationContext(r.Client, r.Scheme, r.Config, r.Recorder, instance)
+
+	// Create status updater
+	statusUpdater := NewStatusUpdater(r.Client)
 
 	// Defer status update for managed resources, will run even if reconcile returns early with error
 	defer func() {
-		r.updateManagedResourcesStatus(ctx, instance)
-
-		// Only update if status changed
-		if !reflect.DeepEqual(originalStatus, instance.Status) {
-
-			// Try adding a retry mechanism
-			var updateErr error
-			for i := 0; i < 3; i++ {
-				updateErr = r.Status().Update(ctx, instance)
-				if updateErr == nil {
-					klog.Infof("Successfully updated AccountIAM status after %d attempts", i+1)
-					break
-				}
-
-				klog.Errorf("Failed to update AccountIAM status (attempt %d/3): %v", i+1, updateErr)
-				time.Sleep(1 * time.Second)
-			}
-
-			if updateErr != nil {
-				klog.Errorf("All attempts to update status failed: %v", updateErr)
-			}
+		// Update status using the new status updater
+		if err := statusUpdater.UpdateStatus(ctx, instance, reconcilationCtx.StatusChecker); err != nil {
+			klog.Errorf("Failed to update status: %v", err)
 		}
 	}()
 
-	if err := r.verifyPrereq(ctx, instance); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if err := r.reconcileOperandResources(ctx, instance); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if err := r.configIM(ctx, instance); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if err := r.reconcileUI(ctx, instance); err != nil {
+	// Create and execute phases using the orchestrator
+	orchestrator := NewPhaseOrchestrator()
+	if err := orchestrator.ExecutePhases(ctx, reconcilationCtx); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -616,25 +588,62 @@ func (r *AccountIAMReconciler) createOperandRBAC(ctx context.Context, instance *
 // -------------- Reconcile resources helper functions --------------
 
 func (r *AccountIAMReconciler) reconcileOperandResources(ctx context.Context, instance *operatorv1alpha1.AccountIAM) error {
+	// Create resource manager and processor
+	resourceManager := NewResourceManager(r.Client, r.Scheme, instance)
+	manifestProcessor := NewManifestProcessor(resourceManager)
 
 	// TODO: will need to find a better place to initialize the database
 	klog.Infof("Applying DB Bootstrap Job")
-	object := &unstructured.Unstructured{}
-	resource := images.ReplaceInYAML(yamls.DB_BOOTSTRAP_JOB)
-	manifest := []byte(resource)
-	if err := yaml.Unmarshal(manifest, object); err != nil {
-		return err
-	}
-	object.SetNamespace(instance.Namespace)
-	if err := controllerutil.SetControllerReference(instance, object, r.Scheme); err != nil {
-		return err
-	}
-	if err := r.createOrUpdate(ctx, object); err != nil {
+	dbBootstrapManifest := images.ReplaceInYAML(yamls.DB_BOOTSTRAP_JOB)
+	if err := manifestProcessor.processStaticManifest(ctx, dbBootstrapManifest); err != nil {
 		return err
 	}
 
 	// Manifests which need data injected before creation
 	klog.Infof("Creating MCSP secrets")
+
+	// Get WLP client ID and prepare data
+	if err := r.prepareIntegrationDataForOperands(ctx, instance); err != nil {
+		return err
+	}
+
+	// Process template manifests with data injection
+	if err := manifestProcessor.ProcessTemplateManifests(ctx,
+		append(yamls.APP_SECRETS, yamls.IM_INTEGRATION_YAMLS...),
+		BootstrapData, IntegrationData); err != nil {
+		return err
+	}
+
+	// Process static manifests
+	klog.Infof("Creating MCSP static yamls")
+	if err := manifestProcessor.ProcessStaticManifests(ctx, yamls.APP_STATIC_YAMLS); err != nil {
+		return err
+	}
+
+	// Process Account IAM resources with namespace replacement
+	klog.Infof("Creating Account IAM yamls")
+	accountIAMManifests := r.prepareAccountIAMManifestsWithNamespace(instance.Namespace, yamls.ACCOUNT_IAM_RES)
+	if err := manifestProcessor.ProcessStaticManifests(ctx, accountIAMManifests); err != nil {
+		return err
+	}
+
+	// Process Account IAM Routes
+	klog.Infof("Creating Account IAM Routes")
+	if err := r.processAccountIAMRoutesWithCA(ctx, instance, manifestProcessor); err != nil {
+		return err
+	}
+
+	// Configure issuer and wait for updates
+	if err := r.configureIssuerAndWaitForUpdate(ctx, instance); err != nil {
+		return err
+	}
+
+	klog.Infof("User Management operand resources created successfully")
+	return nil
+}
+
+// prepareIntegrationDataForOperands prepares integration data for operand resources
+func (r *AccountIAMReconciler) prepareIntegrationDataForOperands(ctx context.Context, instance *operatorv1alpha1.AccountIAM) error {
 	// Get WLP client ID
 	wlpClientID, err := utils.GetSecretData(ctx, r.Client, resources.IMOIDCCrendential, instance.Namespace, resources.WLPClientID)
 	if err != nil {
@@ -664,54 +673,20 @@ func (r *AccountIAMReconciler) reconcileOperandResources(ctx context.Context, in
 		IntegrationData.CurrentEncryptionKeyNum = base64.StdEncoding.EncodeToString([]byte(IntegrationData.CurrentEncryptionKeyNum))
 	}
 
-	if err := r.injectData(ctx, instance, append(yamls.APP_SECRETS, yamls.IM_INTEGRATION_YAMLS...), BootstrapData, IntegrationData); err != nil {
-		return err
+	return nil
+}
+
+// prepareAccountIAMManifestsWithNamespace prepares Account IAM manifests with namespace replacement
+func (r *AccountIAMReconciler) prepareAccountIAMManifestsWithNamespace(namespace string, manifests []string) []string {
+	var prepared []string
+	for _, manifest := range manifests {
+		prepared = append(prepared, strings.ReplaceAll(manifest, "${NAMESPACE}", namespace))
 	}
+	return prepared
+}
 
-	// static manifests which do not change
-	klog.Infof("Creating MCSP static yamls")
-	for _, v := range yamls.APP_STATIC_YAMLS {
-		object := &unstructured.Unstructured{}
-
-		if images.ContainsImageReferences(v) {
-			v = images.ReplaceInYAML(v)
-		}
-
-		manifest := []byte(v)
-		if err := yaml.Unmarshal(manifest, object); err != nil {
-			return err
-		}
-		object.SetNamespace(instance.Namespace)
-		if err := controllerutil.SetControllerReference(instance, object, r.Scheme); err != nil {
-			return err
-		}
-		if err := r.createOrUpdate(ctx, object); err != nil {
-			return err
-		}
-	}
-
-	klog.Infof("Creating Account IAM yamls")
-	for _, v := range yamls.ACCOUNT_IAM_RES {
-		object := &unstructured.Unstructured{}
-		v = strings.ReplaceAll(v, "${NAMESPACE}", instance.Namespace)
-		if images.ContainsImageReferences(v) {
-			v = images.ReplaceInYAML(v)
-		}
-
-		manifest := []byte(v)
-		if err := yaml.Unmarshal(manifest, object); err != nil {
-			return err
-		}
-		object.SetNamespace(instance.Namespace)
-		if err := controllerutil.SetControllerReference(instance, object, r.Scheme); err != nil {
-			return err
-		}
-		if err := r.createOrUpdate(ctx, object); err != nil {
-			return err
-		}
-	}
-
-	klog.Infof("Creating Account IAM Routes")
+// processAccountIAMRoutesWithCA processes Account IAM routes with CA certificate data
+func (r *AccountIAMReconciler) processAccountIAMRoutesWithCA(ctx context.Context, instance *operatorv1alpha1.AccountIAM, processor *ManifestProcessor) error {
 	caCRT, err := utils.GetSecretData(ctx, r.Client, resources.AccountIAMCACert, instance.Namespace, resources.CAKey)
 	if err != nil {
 		klog.Errorf("Failed to get ca.crt from secret %s in namespace %s", resources.CSCASecret, instance.Namespace)
@@ -722,10 +697,11 @@ func (r *AccountIAMReconciler) reconcileOperandResources(ctx context.Context, in
 		CAcert: utils.IndentCert(caCRT, 6),
 	}
 
-	if err := r.injectData(ctx, instance, yamls.ACCOUNT_IAM_ROUTE_RES, RouteData); err != nil {
-		return err
-	}
+	return processor.ProcessTemplateManifests(ctx, yamls.ACCOUNT_IAM_ROUTE_RES, RouteData)
+}
 
+// configureIssuerAndWaitForUpdate configures the issuer and waits for ConfigMap update
+func (r *AccountIAMReconciler) configureIssuerAndWaitForUpdate(ctx context.Context, instance *operatorv1alpha1.AccountIAM) error {
 	// Ensure the CommonService CR is configured to set the desired OIDC issuer URL.
 	// This is the trigger for the platform-auth-idp ConfigMap to be updated by IM operator.
 	klog.Infof("Ensuring OIDC issuer URL is configured in CommonService CR")
@@ -742,45 +718,15 @@ func (r *AccountIAMReconciler) reconcileOperandResources(ctx context.Context, in
 		return fmt.Errorf("failed waiting for issuer in ConfigMap: %w", err)
 	}
 
-	klog.Infof("User Management operand resources created successfully")
 	return nil
 }
 
 func (r *AccountIAMReconciler) injectData(ctx context.Context, instance *operatorv1alpha1.AccountIAM, manifests []string, dataList ...interface{}) error {
+	// Use the new resource manager for better performance and consistency
+	resourceManager := NewResourceManager(r.Client, r.Scheme, instance)
+	manifestProcessor := NewManifestProcessor(resourceManager)
 
-	// Combine the data from all structs into a single map
-	combinedData := utils.CombineData(dataList...)
-
-	var buffer bytes.Buffer
-	// Loop through each secret manifest that requires data injection
-	for _, manifest := range manifests {
-		object := &unstructured.Unstructured{}
-		buffer.Reset()
-
-		if images.ContainsImageReferences(manifest) {
-			manifest = images.ReplaceInYAML(manifest)
-		}
-
-		t := template.Must(template.New("template resources").Parse(manifest))
-		if err := t.Execute(&buffer, combinedData); err != nil {
-			return err
-		}
-
-		if err := yaml.Unmarshal(buffer.Bytes(), object); err != nil {
-			return err
-		}
-
-		object.SetNamespace(instance.Namespace)
-		if err := controllerutil.SetControllerReference(instance, object, r.Scheme); err != nil {
-			return err
-		}
-
-		if err := r.createOrUpdate(ctx, object); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return manifestProcessor.ProcessTemplateManifests(ctx, manifests, dataList...)
 }
 
 func (r *AccountIAMReconciler) configureIssuerViaCS(ctx context.Context) error {
@@ -960,57 +906,24 @@ func (r *AccountIAMReconciler) configIM(ctx context.Context, instance *operatorv
 // -------------- Reconcile UI functions --------------
 
 func (r *AccountIAMReconciler) reconcileUI(ctx context.Context, instance *operatorv1alpha1.AccountIAM) error {
+	// Create resource manager and processor
+	resourceManager := NewResourceManager(r.Client, r.Scheme, instance)
+	manifestProcessor := NewManifestProcessor(resourceManager)
+
 	if err := r.initUIBootstrapData(ctx, instance); err != nil {
 		return err
 	}
 
-	// Manifests which need data injected before creation
-	object := &unstructured.Unstructured{}
-	tmpl := template.New("template for injecting data into YAMLs")
-	var tmplWriter bytes.Buffer
-	for _, v := range yamls.TemplateYamlsUI {
-		manifest := v
-		tmplWriter.Reset()
-
-		tmpl, err := tmpl.Parse(manifest)
-		if err != nil {
-			return err
-		}
-		if err := tmpl.Execute(&tmplWriter, UIBootstrapData); err != nil {
-			return err
-		}
-
-		if err := yaml.Unmarshal(tmplWriter.Bytes(), object); err != nil {
-			return err
-		}
-		object.SetNamespace(instance.Namespace)
-		if err := controllerutil.SetControllerReference(instance, object, r.Scheme); err != nil {
-			return err
-		}
-		if err := r.createOrUpdate(ctx, object); err != nil {
-			return err
-		}
+	// Process template manifests with UI data
+	klog.Infof("Creating UI template resources")
+	if err := manifestProcessor.ProcessTemplateManifests(ctx, yamls.TemplateYamlsUI, UIBootstrapData); err != nil {
+		return err
 	}
 
+	// Process static UI manifests
 	klog.Infof("Creating static yamls for UI")
-	for _, v := range yamls.StaticYamlsUI {
-		object := &unstructured.Unstructured{}
-
-		if images.ContainsImageReferences(v) {
-			v = images.ReplaceInYAML(v)
-		}
-
-		manifest := []byte(v)
-		if err := yaml.Unmarshal(manifest, object); err != nil {
-			return err
-		}
-		object.SetNamespace(instance.Namespace)
-		if err := controllerutil.SetControllerReference(instance, object, r.Scheme); err != nil {
-			return err
-		}
-		if err := r.createOrUpdate(ctx, object); err != nil {
-			return err
-		}
+	if err := manifestProcessor.ProcessStaticManifests(ctx, yamls.StaticYamlsUI); err != nil {
+		return err
 	}
 
 	return nil
@@ -1192,107 +1105,6 @@ func (r *AccountIAMReconciler) createOrUpdate(ctx context.Context, obj *unstruct
 	}
 
 	return nil
-}
-
-// updateManagedResourcesStatus updates the status field of the AccountIAM CR
-// with information about all the resources it manages
-func (r *AccountIAMReconciler) updateManagedResourcesStatus(ctx context.Context, instance *operatorv1alpha1.AccountIAM) {
-
-	// Create a direct AccountIAM service status
-	accountIAMService := odlm.OperandStatus{
-		ObjectName: instance.Name,
-		Kind:       resources.UserMgmtCR,
-		APIVersion: resources.OperatorIBMApiVersion,
-		Namespace:  instance.Namespace,
-		Status:     resources.PhaseRunning, // Default to running, will update if any resource is not ready
-	}
-
-	var managedResources []odlm.ResourceStatus
-	allResourcesReady := true
-
-	// Check Redis status
-	redisResource, redisReady := utils.GetRedisResourceStatus(ctx, r.Client, instance.Namespace)
-	managedResources = append(managedResources, redisResource)
-	if !redisReady {
-		allResourcesReady = false
-	}
-
-	// Check OperandRequest status
-	operandResource, operandReady := utils.GetOperandRequestStatus(ctx, r.Client, instance.Namespace)
-	managedResources = append(managedResources, operandResource)
-	if !operandReady {
-		allResourcesReady = false
-	}
-
-	// Check job statuses
-	jobsToCheck := []string{resources.CreateDBJob, resources.DBMigrationJob, resources.IMConfigJob}
-	for _, jobName := range jobsToCheck {
-		jobResource, jobReady := utils.GetJobStatus(ctx, r.Client, jobName, instance.Namespace)
-		managedResources = append(managedResources, jobResource)
-		if !jobReady {
-			allResourcesReady = false
-		}
-	}
-
-	// Check service statuses
-	servicesToCheck := []string{
-		resources.AccountIAM,
-		resources.AccountIAMUIService,
-		resources.AccountIAMUIAPIService,
-	}
-	for _, serviceName := range servicesToCheck {
-		serviceResource, serviceReady := utils.GetServiceStatus(ctx, r.Client, serviceName, instance.Namespace)
-		managedResources = append(managedResources, serviceResource)
-		if !serviceReady {
-			allResourcesReady = false
-		}
-	}
-
-	// Check secret statuses
-	secretsToCheck := []string{
-		resources.BootstrapSecret,
-		resources.AccountIAMDBSecret,
-		resources.AccountIAMConfigSecret,
-		resources.AccountIAMOidcClientAuth,
-		resources.AccountIAMOKDAuth,
-		resources.AccountIAMUISecrets,
-		resources.IMOIDCCrendential,
-		resources.IMAPISecret,
-		resources.AccountIAMCACert,
-	}
-	for _, secretName := range secretsToCheck {
-		secretResource, secretReady := utils.GetSecretStatus(ctx, r.Client, secretName, instance.Namespace)
-		managedResources = append(managedResources, secretResource)
-		if !secretReady {
-			allResourcesReady = false
-		}
-	}
-
-	// Check route statuses
-	routesToCheck := []string{
-		resources.AccountIAM,
-		resources.AccountIAMUIRoute,
-		resources.AccountIAMUIAPIInstance,
-	}
-	for _, routeName := range routesToCheck {
-		routeResource, routeReady := utils.GetRouteStatus(ctx, r.Client, routeName, instance.Namespace)
-		managedResources = append(managedResources, routeResource)
-		if !routeReady {
-			allResourcesReady = false
-		}
-	}
-
-	if !allResourcesReady {
-		accountIAMService.Status = resources.StatusNotReady
-	}
-
-	accountIAMService.ManagedResources = managedResources
-
-	instance.Status.Service = accountIAMService
-
-	klog.Infof("Account IAM service status: resourceCount %d, status is %s",
-		len(accountIAMService.ManagedResources), accountIAMService.Status)
-
 }
 
 // SetupWithManager sets up the controller with the Manager.
